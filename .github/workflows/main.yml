@@ -34,20 +34,30 @@ jobs:
 
     - name: 准备环境
       run: |
+        # 创建必要的目录
         mkdir -p source_repo patches
         echo "准备完成"
+        echo "当前工作目录: $(pwd)"
+        echo "目录结构:"
+        ls -la
 
     - name: 克隆源仓库
       run: |
+        echo "正在克隆源仓库..."
+        echo "仓库URL: ${{ github.event.inputs.repo_url }}"
+        echo "分支: ${{ github.event.inputs.branch || '默认分支' }}"
+        
         cd source_repo
-        # 使用轻量克隆
+        
+        CLONE_CMD="git clone --depth 100 --single-branch"
         if [ -n "${{ github.event.inputs.branch }}" ]; then
-          echo "正在克隆 ${{ github.event.inputs.repo_url }} 的分支: ${{ github.event.inputs.branch }}"
-          git clone --depth 100 --single-branch --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
+          $CLONE_CMD --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
         else
-          echo "正在克隆 ${{ github.event.inputs.repo_url }} 的默认分支"
-          git clone --depth 100 --single-branch "${{ github.event.inputs.repo_url }}" .
+          $CLONE_CMD "${{ github.event.inputs.repo_url }}" .
         fi
+        
+        echo "克隆完成，当前分支: $(git branch --show-current)"
+        echo "最近提交: $(git log -1 --oneline)"
 
     - name: 生成补丁文件
       id: generate
@@ -58,6 +68,9 @@ jobs:
         echo "正在解析提交哈希..."
         START_HASH=$(git rev-parse "${{ github.event.inputs.start_commit }}")
         END_HASH=$(git rev-parse "${{ github.event.inputs.end_commit }}")
+        
+        echo "起始提交哈希: $START_HASH"
+        echo "结束提交哈希: $END_HASH"
         
         # 验证提交是否存在
         if ! git rev-parse --verify "$START_HASH" >/dev/null 2>&1; then
@@ -70,6 +83,14 @@ jobs:
           exit 1
         fi
 
+        # 检查提交顺序
+        if git merge-base --is-ancestor "$END_HASH" "$START_HASH"; then
+          echo "::warning::提交顺序可能颠倒，交换起始和结束提交"
+          TEMP_HASH=$START_HASH
+          START_HASH=$END_HASH
+          END_HASH=$TEMP_HASH
+        fi
+
         # 创建输出目录
         OUTPUT_DIR="../../patches"
         mkdir -p "$OUTPUT_DIR"
@@ -78,19 +99,50 @@ jobs:
         # 根据选择的类型生成补丁
         if [ "${{ github.event.inputs.patch_type }}" = "单个" ]; then
           echo "正在生成单个补丁文件..."
-          git diff "$START_HASH" "$END_HASH" > "$OUTPUT_DIR/combined.patch"
-          PATCH_COUNT=1
-          echo "已生成单个补丁文件: combined.patch"
+          git diff "$START_HASH" "$END_HASH" > "$OUTPUT_DIR/combined.patch" || echo "生成单个补丁失败"
+          
+          if [ -s "$OUTPUT_DIR/combined.patch" ]; then
+            PATCH_COUNT=1
+            echo "已生成单个补丁文件: combined.patch"
+          else
+            echo "::warning::生成的单个补丁文件为空"
+          fi
         else
           echo "正在生成多个补丁文件..."
-          # 检查是否需要获取更多历史
-          if ! git merge-base --is-ancestor "$START_HASH" "$END_HASH" 2>/dev/null; then
-            echo "提交范围不在当前克隆深度内，获取更多历史..."
-            git fetch --depth=1000
+          
+          # 检查提交范围是否有效
+          COMMIT_RANGE="$START_HASH..$END_HASH"
+          echo "提交范围: $COMMIT_RANGE"
+          
+          # 获取提交数量
+          COMMIT_COUNT=$(git rev-list --count $COMMIT_RANGE || echo 0)
+          echo "范围内提交数量: $COMMIT_COUNT"
+          
+          if [ "$COMMIT_COUNT" -eq 0 ]; then
+            echo "::warning::提交范围内没有提交，尝试交换顺序..."
+            COMMIT_RANGE="$END_HASH..$START_HASH"
+            COMMIT_COUNT=$(git rev-list --count $COMMIT_RANGE || echo 0)
+            echo "交换后范围内提交数量: $COMMIT_COUNT"
           fi
-          git format-patch "$START_HASH..$END_HASH" -o "$OUTPUT_DIR" --quiet
-          PATCH_COUNT=$(ls -1 "$OUTPUT_DIR"/*.patch 2>/dev/null | wc -l)
-          echo "已生成 $PATCH_COUNT 个补丁文件"
+          
+          if [ "$COMMIT_COUNT" -gt 0 ]; then
+            # 确保有足够的历史
+            CURRENT_DEPTH=$(git rev-list --count HEAD)
+            if [ "$COMMIT_COUNT" -gt $CURRENT_DEPTH ]; then
+              echo "需要更多历史记录，当前深度: $CURRENT_DEPTH, 需要: $COMMIT_COUNT"
+              git fetch --depth=$((COMMIT_COUNT + 10))
+            fi
+            
+            # 生成补丁
+            git format-patch $COMMIT_RANGE -o "$OUTPUT_DIR" --quiet
+            PATCH_COUNT=$(ls -1 "$OUTPUT_DIR"/*.patch 2>/dev/null | wc -l)
+            echo "已生成 $PATCH_COUNT 个补丁文件"
+          else
+            echo "::error::提交范围内没有有效的提交"
+            echo "起始提交: $(git show -s --format='%h %s' $START_HASH)"
+            echo "结束提交: $(git show -s --format='%h %s' $END_HASH)"
+            exit 1
+          fi
         fi
 
         # 设置输出变量
@@ -98,18 +150,34 @@ jobs:
         echo "patch_count=$PATCH_COUNT" >> $GITHUB_OUTPUT
         echo "patch_type=${{ github.event.inputs.patch_type }}" >> $GITHUB_OUTPUT
 
+    - name: 检查补丁文件
+      run: |
+        echo "检查补丁目录内容..."
+        echo "补丁目录路径: $(pwd)/patches"
+        ls -la patches || echo "补丁目录不存在"
+        
+        if [ -d "patches" ]; then
+          echo "补丁文件列表:"
+          ls -l patches/*.patch 2>/dev/null || echo "没有找到补丁文件"
+        fi
+
     - name: 创建时间戳命名的 ZIP 文件
       id: create_zip
       run: |
         # 检查补丁目录是否存在
         if [ ! -d "patches" ]; then
-          echo "::error::补丁目录不存在，请检查生成步骤"
+          echo "::error::补丁目录不存在"
           exit 1
         fi
         
         # 检查是否有补丁文件
-        if [ -z "$(ls -A patches)" ]; then
-          echo "::error::补丁目录为空，没有生成补丁文件"
+        PATCH_FILES=$(ls patches/*.patch 2>/dev/null | wc -l)
+        if [ "$PATCH_FILES" -eq 0 ]; then
+          echo "::error::没有生成任何补丁文件"
+          echo "可能原因:"
+          echo "1. 起始提交和结束提交相同"
+          echo "2. 提交顺序错误"
+          echo "3. 提交范围内没有变更"
           exit 1
         fi
         
