@@ -33,12 +33,23 @@ on:
           - 'true'
           - 'false'
 
+# 添加工作流级别的权限
+permissions:
+  contents: write
+
 jobs:
   Make:
     runs-on: ubuntu-latest
+    # 添加作业级别的权限（双重保障）
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    
     env:
       WORKSPACE: ${{ github.workspace }}
       BUILD_DATE: $(date +'%Y%m%d')
+    
     steps:
     - name: 检出当前仓库
       uses: actions/checkout@v4
@@ -121,7 +132,11 @@ jobs:
         echo "补丁生成完成"
         echo "ZIP文件: ${{ steps.create_zip.outputs.zip_name }}"
         if [ "${{ github.event.inputs.create_release }}" = "true" ]; then
-          echo "GitHub Release 已创建: ${{ steps.create_release.outputs.url }}"
+          if [ "${{ steps.create_release.conclusion }}" = "success" ]; then
+            echo "GitHub Release 已创建: ${{ steps.create_release.outputs.url }}"
+          else
+            echo "GitHub Release 创建失败，请检查权限设置"
+          fi
         else
           echo "可在工作流产物中下载补丁文件"
         fi
