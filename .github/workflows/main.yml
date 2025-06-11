@@ -40,13 +40,12 @@ jobs:
     - name: 克隆源仓库
       run: |
         cd source_repo
-        # 使用轻量克隆
         if [ -n "${{ github.event.inputs.branch }}" ]; then
           echo "正在克隆 ${{ github.event.inputs.repo_url }} 的分支: ${{ github.event.inputs.branch }}"
-          git clone --depth 1 --single-branch --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
+          git clone --single-branch --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
         else
           echo "正在克隆 ${{ github.event.inputs.repo_url }} 的默认分支"
-          git clone --depth 1 --single-branch "${{ github.event.inputs.repo_url }}" .
+          git clone --single-branch "${{ github.event.inputs.repo_url }}" .
         fi
 
     - name: 生成补丁文件
