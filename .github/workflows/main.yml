@@ -63,9 +63,9 @@ jobs:
       run: |
         cd "$WORKSPACE/source_repo"
         if [ -n "${{ github.event.inputs.branch }}" ]; then
-          git clone --depth 100 --single-branch --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
+          git clone --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
         else
-          git clone --depth 100 --single-branch "${{ github.event.inputs.repo_url }}" .
+          git clone "${{ github.event.inputs.repo_url }}" .
         fi
 
     - name: 生成补丁文件
