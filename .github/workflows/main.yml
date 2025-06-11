@@ -40,12 +40,13 @@ jobs:
     - name: 克隆源仓库
       run: |
         cd source_repo
+        # 使用轻量克隆
         if [ -n "${{ github.event.inputs.branch }}" ]; then
           echo "正在克隆 ${{ github.event.inputs.repo_url }} 的分支: ${{ github.event.inputs.branch }}"
-          git clone --single-branch --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
+          git clone --depth 100 --single-branch --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
         else
           echo "正在克隆 ${{ github.event.inputs.repo_url }} 的默认分支"
-          git clone --single-branch "${{ github.event.inputs.repo_url }}" .
+          git clone --depth 100 --single-branch "${{ github.event.inputs.repo_url }}" .
         fi
 
     - name: 生成补丁文件
@@ -82,8 +83,11 @@ jobs:
           echo "已生成单个补丁文件: combined.patch"
         else
           echo "正在生成多个补丁文件..."
-          # 获取完整历史以生成多个补丁
-          git fetch --unshallow
+          # 仅在需要时获取更多历史
+          if ! git merge-base --is-ancestor "$START_HASH" "$END_HASH" 2>/dev/null; then
+            echo "提交范围不在当前克隆深度内，获取更多历史..."
+            git fetch --unshallow || git fetch --depth=1000
+          fi
           git format-patch "$START_HASH..$END_HASH" -o "$OUTPUT_DIR" --quiet
           PATCH_COUNT=$(ls -1 "$OUTPUT_DIR"/*.patch 2>/dev/null | wc -l)
           echo "已生成 $PATCH_COUNT 个补丁文件"
