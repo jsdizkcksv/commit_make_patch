@@ -6,6 +6,10 @@ on:
       repo_url:
         description: 'Git 仓库 URL'
         required: true
+      branch:
+        description: '仓库分支 (默认使用默认分支)'
+        required: false
+        default: ''
       start_commit:
         description: '起始提交'
         required: true
@@ -28,56 +32,59 @@ jobs:
     - name: 检出当前仓库
       uses: actions/checkout@v4
 
+    - name: 准备环境
+      run: |
+        mkdir -p source_repo
+        echo "准备完成"
+
+    - name: 克隆源仓库
+      run: |
+        cd source_repo
+        # 使用轻量克隆
+        if [ -n "${{ github.event.inputs.branch }}" ]; then
+          echo "正在克隆 ${{ github.event.inputs.repo_url }} 的分支: ${{ github.event.inputs.branch }}"
+          git clone --depth 1 --single-branch --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
+        else
+          echo "正在克隆 ${{ github.event.inputs.repo_url }} 的默认分支"
+          git clone --depth 1 --single-branch "${{ github.event.inputs.repo_url }}" .
+        fi
+
     - name: 生成补丁文件
       id: generate
       run: |
-        #!/bin/bash
-        set -euo pipefail
-
-        # 修正输入参数访问方式
-        REPO_URL="${{ github.event.inputs.repo_url }}"
-        START_COMMIT="${{ github.event.inputs.start_commit }}"
-        END_COMMIT="${{ github.event.inputs.end_commit }}"
-        PATCH_TYPE="${{ github.event.inputs.patch_type }}"
-        OUTPUT_DIR="./patches"
-
-        # 创建临时目录
-        TEMP_DIR=$(mktemp -d)
-        echo "临时工作目录: $TEMP_DIR"
-
-        # 克隆仓库（单分支完整历史）
-        echo "正在克隆仓库（单分支完整历史）..."
-        git clone --single-branch "$REPO_URL" "$TEMP_DIR"
-        cd "$TEMP_DIR"
-
+        cd source_repo
+        
         # 获取实际提交哈希
         echo "正在解析提交哈希..."
-        START_HASH=$(git rev-parse "$START_COMMIT")
-        END_HASH=$(git rev-parse "$END_COMMIT")
-
+        START_HASH=$(git rev-parse "${{ github.event.inputs.start_commit }}")
+        END_HASH=$(git rev-parse "${{ github.event.inputs.end_commit }}")
+        
         # 验证提交是否存在
         if ! git rev-parse --verify "$START_HASH" >/dev/null 2>&1; then
-          echo "::error::起始提交 '$START_COMMIT' 不存在"
+          echo "::error::起始提交 '${{ github.event.inputs.start_commit }}' 不存在"
           exit 1
         fi
 
         if ! git rev-parse --verify "$END_HASH" >/dev/null 2>&1; then
-          echo "::error::结束提交 '$END_COMMIT' 不存在"
+          echo "::error::结束提交 '${{ github.event.inputs.end_commit }}' 不存在"
           exit 1
         fi
 
         # 创建输出目录
+        OUTPUT_DIR="../patches"
         mkdir -p "$OUTPUT_DIR"
         PATCH_COUNT=0
 
         # 根据选择的类型生成补丁
-        if [ "$PATCH_TYPE" = "单个" ]; then
+        if [ "${{ github.event.inputs.patch_type }}" = "单个" ]; then
           echo "正在生成单个补丁文件..."
           git diff "$START_HASH" "$END_HASH" > "$OUTPUT_DIR/combined.patch"
           PATCH_COUNT=1
           echo "已生成单个补丁文件: combined.patch"
         else
           echo "正在生成多个补丁文件..."
+          # 获取完整历史以生成多个补丁
+          git fetch --unshallow
           git format-patch "$START_HASH..$END_HASH" -o "$OUTPUT_DIR" --quiet
           PATCH_COUNT=$(ls -1 "$OUTPUT_DIR"/*.patch 2>/dev/null | wc -l)
           echo "已生成 $PATCH_COUNT 个补丁文件"
@@ -86,7 +93,7 @@ jobs:
         # 设置输出变量
         echo "patch_dir=$OUTPUT_DIR" >> $GITHUB_OUTPUT
         echo "patch_count=$PATCH_COUNT" >> $GITHUB_OUTPUT
-        echo "patch_type=$PATCH_TYPE" >> $GITHUB_OUTPUT
+        echo "patch_type=${{ github.event.inputs.patch_type }}" >> $GITHUB_OUTPUT
 
     - name: 创建时间戳命名的 ZIP 文件
       id: create_zip
@@ -95,19 +102,20 @@ jobs:
         TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
         ZIP_NAME="patch_$TIMESTAMP.zip"
         
-        # 进入补丁目录
-        cd ${{ steps.generate.outputs.patch_dir }}
-        
         # 创建 ZIP 文件
+        cd ${{ steps.generate.outputs.patch_dir }}
         zip -r "../$ZIP_NAME" .
-        
-        # 返回上级目录
         cd ..
         
         # 设置输出变量
         echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
         echo "zip_path=$(pwd)/$ZIP_NAME" >> $GITHUB_OUTPUT
         echo "已创建 ZIP 文件: $ZIP_NAME"
+
+    - name: 清理源仓库
+      run: |
+        rm -rf source_repo
+        echo "已清理源仓库"
 
     - name: 上传 ZIP 文件到工作流产物
       uses: actions/upload-artifact@v4
@@ -118,7 +126,7 @@ jobs:
 
     - name: 显示结果
       run: |
-        if [ "${{ steps.generate.outputs.patch_type }}" = "单个" ]; then
+        if [ "${{ github.event.inputs.patch_type }}" = "单个" ]; then
           echo "成功生成单个补丁文件: combined.patch"
         else
           echo "成功生成 ${{ steps.generate.outputs.patch_count }} 个补丁文件"
