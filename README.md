@@ -1,0 +1,2 @@
+# commit_make_patch
+一键根据commit范围生成补丁patch文件
