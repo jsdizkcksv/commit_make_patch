@@ -38,7 +38,7 @@ jobs:
       run: |
         # 创建工作区目录
         mkdir -p source_repo
-        mkdir -p "$WORKSPACE/patches"
+        mkdir -p patches
         echo "工作区路径: $WORKSPACE"
         echo "准备完成"
 
@@ -67,8 +67,8 @@ jobs:
         START_HASH=$(git rev-parse "${{ github.event.inputs.start_commit }}")
         END_HASH=$(git rev-parse "${{ github.event.inputs.end_commit }}")
         
-        echo "起始提交: $START_HASH ($(git show -s --format='%s' $START_HASH))"
-        echo "结束提交: $END_HASH ($(git show -s --format='%s' $END_HASH))"
+        echo "起始提交: $START_HASH"
+        echo "结束提交: $END_HASH"
         
         # 验证提交
         if ! git rev-parse --verify "$START_HASH" >/dev/null 2>&1; then
@@ -81,63 +81,26 @@ jobs:
           exit 1
         fi
 
-        # 创建输出目录
-        OUTPUT_DIR="$WORKSPACE/patches"
-        mkdir -p "$OUTPUT_DIR"
-        echo "补丁输出目录: $OUTPUT_DIR"
-
         # 生成补丁
         if [ "${{ github.event.inputs.patch_type }}" = "单个" ]; then
           echo "生成单个补丁文件..."
-          git diff "$START_HASH" "$END_HASH" > "$OUTPUT_DIR/combined.patch"
-          
-          # 验证文件
-          if [ -s "$OUTPUT_DIR/combined.patch" ]; then
-            echo "补丁文件大小: $(wc -c < "$OUTPUT_DIR/combined.patch") 字节"
-            echo "文件路径: $OUTPUT_DIR/combined.patch"
-          else
-            echo "::warning::生成的补丁文件为空"
-          fi
+          git diff "$START_HASH" "$END_HASH" > "$WORKSPACE/patches/combined.patch"
+          echo "补丁文件路径: $WORKSPACE/patches/combined.patch"
         else
           echo "生成多个补丁文件..."
-          git format-patch "$START_HASH..$END_HASH" -o "$OUTPUT_DIR"
+          git format-patch "$START_HASH..$END_HASH" -o "$WORKSPACE/patches"
           echo "生成的文件:"
-          ls -l "$OUTPUT_DIR"
-        fi
-
-        # 设置输出变量
-        echo "patch_dir=$OUTPUT_DIR" >> $GITHUB_OUTPUT
-        echo "patch_type=${{ github.event.inputs.patch_type }}" >> $GITHUB_OUTPUT
-
-    - name: 验证补丁文件
-      run: |
-        echo "检查补丁目录: $WORKSPACE/patches"
-        ls -la "$WORKSPACE/patches"
-        
-        if [ "${{ github.event.inputs.patch_type }}" = "单个" ]; then
-          if [ -f "$WORKSPACE/patches/combined.patch" ]; then
-            echo "找到单个补丁文件"
-            echo "文件大小: $(wc -c < "$WORKSPACE/patches/combined.patch") 字节"
-          else
-            echo "::error::未找到补丁文件"
-            exit 1
-          fi
-        else
-          PATCH_COUNT=$(ls -1 "$WORKSPACE/patches"/*.patch 2>/dev/null | wc -l)
-          if [ "$PATCH_COUNT" -gt 0 ]; then
-            echo "找到 $PATCH_COUNT 个补丁文件"
-          else
-            echo "::error::未找到任何补丁文件"
-            exit 1
-          fi
+          ls -l "$WORKSPACE/patches"
         fi
 
     - name: 创建时间戳命名的 ZIP 文件
       id: create_zip
       run: |
+        # 生成时间戳（年月日_时分秒）
         TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
         ZIP_NAME="patch_$TIMESTAMP.zip"
         
+        # 创建 ZIP 文件
         cd "$WORKSPACE/patches"
         zip -r "$WORKSPACE/$ZIP_NAME" .
         
@@ -148,12 +111,13 @@ jobs:
     - name: 清理环境
       run: |
         rm -rf "$WORKSPACE/source_repo"
-        echo "已清理源仓库"
+        rm -rf "$WORKSPACE/patches"
+        echo "已清理临时文件"
 
     - name: 上传 ZIP 文件
       uses: actions/upload-artifact@v4
       with:
-        name: git-patches
+        name: ${{ steps.create_zip.outputs.zip_name }}
         path: ${{ steps.create_zip.outputs.zip_path }}
         if-no-files-found: error
 
@@ -161,4 +125,4 @@ jobs:
       run: |
         echo "补丁生成完成"
         echo "ZIP文件: ${{ steps.create_zip.outputs.zip_name }}"
-        echo "可在工作流产物中下载"
+        echo "可在工作流产物中直接下载"
