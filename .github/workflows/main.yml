@@ -4,26 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       repo_url:
-        description: 'Git 仓库 URL'
+        description: 'Git 仓库 URL（私库请用 https 形式，如 https://github.com/owner/repo）'
         required: true
+        type: string
       branch:
-        description: '仓库分支 (默认使用默认分支)'
+        description: '仓库分支（留空使用默认分支）'
         required: false
         default: ''
+        type: string
       start_commit:
-        description: '起始提交'
+        description: '起始提交（含，SHA / tag / 分支名）'
         required: true
+        type: string
       end_commit:
-        description: '结束提交'
+        description: '结束提交（含，SHA / tag / 分支名）'
         required: true
+        type: string
       patch_type:
         description: '补丁文件类型'
         required: true
         default: '多个'
         type: choice
         options:
-          - '单个'
           - '多个'
+          - '单个'
       create_release:
         description: '是否创建 GitHub Release'
         required: true
@@ -32,111 +36,248 @@ on:
         options:
           - 'true'
           - 'false'
+      repo_token:
+        description: '私库访问 Token（公开库留空；更推荐用 Secrets.REPO_TOKEN）'
+        required: false
+        default: ''
+        type: string
 
-# 添加工作流级别的权限
+# 工作流级权限：创建 Release 需要 contents: write
 permissions:
   contents: write
+
+concurrency:
+  group: make-patch-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   Make:
     runs-on: ubuntu-latest
-    # 添加作业级别的权限（双重保障）
+    timeout-minutes: 30
     permissions:
       contents: write
-      actions: read
-      id-token: write
-    
+
     env:
       WORKSPACE: ${{ github.workspace }}
-      BUILD_DATE: $(date +'%Y%m%d')
-    
+
     steps:
-    - name: 检出当前仓库
-      uses: actions/checkout@v4
+      - name: 检出当前仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-    - name: 准备环境
-      run: |
-        mkdir -p source_repo patches
-        echo "工作区路径: $WORKSPACE"
+      - name: 初始化环境变量
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORKSPACE/source_repo" "$WORKSPACE/patches"
+          echo "BUILD_DATE=$(date -u +'%Y%m%d')" >> "$GITHUB_ENV"
+          echo "工作区路径: $WORKSPACE"
 
-    - name: 克隆源仓库
-      run: |
-        cd "$WORKSPACE/source_repo"
-        if [ -n "${{ github.event.inputs.branch }}" ]; then
-          git clone --branch "${{ github.event.inputs.branch }}" "${{ github.event.inputs.repo_url }}" .
-        else
-          git clone "${{ github.event.inputs.repo_url }}" .
-        fi
-
-    - name: 生成补丁文件
-      id: generate
-      run: |
-        cd "$WORKSPACE/source_repo"
-        
-        START_HASH=$(git rev-parse "${{ github.event.inputs.start_commit }}")
-        END_HASH=$(git rev-parse "${{ github.event.inputs.end_commit }}")
-        
-        OUTPUT_DIR="$WORKSPACE/patches"
-        mkdir -p "$OUTPUT_DIR"
-
-        if [ "${{ github.event.inputs.patch_type }}" = "单个" ]; then
-          git diff "$START_HASH" "$END_HASH" > "$OUTPUT_DIR/combined.patch"
-          echo "patch_file=combined.patch" >> $GITHUB_OUTPUT
-        else
-          git format-patch "$START_HASH..$END_HASH" -o "$OUTPUT_DIR"
-        fi
-
-        echo "patch_dir=$OUTPUT_DIR" >> $GITHUB_OUTPUT
-
-    - name: 创建时间戳命名的 ZIP 文件
-      id: create_zip
-      run: |
-        TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-        ZIP_NAME="patch_$TIMESTAMP.zip"
-        
-        cd "$WORKSPACE/patches"
-        zip -r "$WORKSPACE/$ZIP_NAME" .
-        
-        echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
-        echo "zip_path=$WORKSPACE/$ZIP_NAME" >> $GITHUB_OUTPUT
-        echo "zip_timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
-
-    - name: 清理环境
-      run: |
-        rm -rf "$WORKSPACE/source_repo"
-        rm -rf "$WORKSPACE/patches"
-
-    - name: 上传 ZIP 文件到工作流产物
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ steps.create_zip.outputs.zip_name }}
-        path: ${{ steps.create_zip.outputs.zip_path }}
-        if-no-files-found: error
-
-    - name: 创建 GitHub Release
-      id: create_release
-      if: ${{ github.event.inputs.create_release == 'true' }}
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: "patch-${{ steps.create_zip.outputs.zip_timestamp }}"
-        name: "Patch Files - ${{ steps.create_zip.outputs.zip_timestamp }}"
-        body: "自动生成的补丁文件"
-        draft: false
-        prerelease: false
-        files: ${{ steps.create_zip.outputs.zip_path }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: 显示结果
-      run: |
-        echo "补丁生成完成"
-        echo "ZIP文件: ${{ steps.create_zip.outputs.zip_name }}"
-        if [ "${{ github.event.inputs.create_release }}" = "true" ]; then
-          if [ "${{ steps.create_release.conclusion }}" = "success" ]; then
-            echo "GitHub Release 已创建: ${{ steps.create_release.outputs.url }}"
-          else
-            echo "GitHub Release 创建失败，请检查权限设置"
+      # 令牌解析：优先使用手动输入的 token，其次回退到仓库 Secret REPO_TOKEN
+      - name: 解析访问令牌
+        id: auth
+        env:
+          INPUT_TOKEN: ${{ github.event.inputs.repo_token }}
+          SECRET_TOKEN: ${{ secrets.REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          TOKEN="$INPUT_TOKEN"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="$SECRET_TOKEN"
           fi
-        else
-          echo "可在工作流产物中下载补丁文件"
-        fi
+          if [ -n "$TOKEN" ]; then
+            # 屏蔽日志中的令牌，避免泄露
+            echo "::add-mask::$TOKEN"
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+          fi
+          # 注意：不 echo token 本身
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: 克隆源仓库
+        env:
+          REPO_URL: ${{ github.event.inputs.repo_url }}
+          BRANCH: ${{ github.event.inputs.branch }}
+          TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          cd "$WORKSPACE/source_repo"
+
+          if [ -n "$TOKEN" ]; then
+            # 把 https://host/owner/repo(.git) 或 git@host:owner/repo(.git) 统一成 https 形式后注入令牌
+            CLEAN=$(printf '%s' "$REPO_URL" | sed -E 's#^https?://##; s#^git@([^:]+):#\1/#')
+            CLEAN="${CLEAN%.git}"
+            CLONE_URL="https://x-access-token:${TOKEN}@${CLEAN}.git"
+            echo "使用令牌克隆私有仓库: ${CLEAN}"
+          else
+            CLONE_URL="$REPO_URL"
+            echo "使用匿名方式克隆: $REPO_URL"
+          fi
+
+          ARGS=(--quiet)
+          if [ -n "$BRANCH" ]; then
+            ARGS+=(--branch "$BRANCH")
+          fi
+
+          git clone "${ARGS[@]}" "$CLONE_URL" .
+
+          # 克隆完成后立刻把 remote 还原成不带令牌的地址，避免令牌残留在 .git/config
+          git remote set-url origin "$REPO_URL"
+
+          echo "当前分支: $(git rev-parse --abbrev-ref HEAD)"
+          echo "HEAD: $(git rev-parse --short HEAD)"
+
+      - name: 生成补丁文件
+        id: generate
+        env:
+          START: ${{ github.event.inputs.start_commit }}
+          END: ${{ github.event.inputs.end_commit }}
+          PATCH_TYPE: ${{ github.event.inputs.patch_type }}
+          BRANCH_NAME: ${{ github.event.inputs.branch }}
+          REPO_URL: ${{ github.event.inputs.repo_url }}
+        run: |
+          set -euo pipefail
+          cd "$WORKSPACE/source_repo"
+
+          git fetch --tags --force origin >/dev/null 2>&1 || true
+
+          START_HASH=$(git rev-parse --verify "${START}^{commit}")
+          END_HASH=$(git rev-parse --verify "${END}^{commit}")
+          echo "起始提交: $START_HASH"
+          echo "结束提交: $END_HASH"
+
+          # 起始提交若为根提交（没有父提交），则用空树/--root 作为基线
+          if git rev-parse --verify --quiet "${START_HASH}^" >/dev/null; then
+            BASE="${START_HASH}^"
+            IS_ROOT=false
+            echo "基线: ${BASE}（起始提交的父提交）"
+          else
+            BASE=""
+            IS_ROOT=true
+            echo "基线: 空树（起始提交即仓库根提交）"
+          fi
+
+          OUTPUT_DIR="$WORKSPACE/patches"
+          mkdir -p "$OUTPUT_DIR"
+
+          # 两端都包含：起始提交自身及其改动也会被导出
+          if [ "$PATCH_TYPE" = "单个" ]; then
+            if [ "$IS_ROOT" = true ]; then
+              EMPTY_TREE=$(git hash-object -t tree /dev/null)
+              git diff "$EMPTY_TREE" "$END_HASH" > "$OUTPUT_DIR/combined.patch"
+            else
+              git diff "$BASE" "$END_HASH" > "$OUTPUT_DIR/combined.patch"
+            fi
+            echo "patch_file=combined.patch" >> "$GITHUB_OUTPUT"
+          else
+            if [ "$IS_ROOT" = true ]; then
+              git format-patch --root "$END_HASH" -o "$OUTPUT_DIR" --no-signature
+            else
+              git format-patch "${BASE}..${END_HASH}" -o "$OUTPUT_DIR" --no-signature
+            fi
+          fi
+
+          # 区间内提交数（含起始提交）
+          COMMIT_COUNT=$(git rev-list --count "${BASE:+${BASE}..}${END_HASH}")
+          echo "区间提交数: $COMMIT_COUNT"
+
+          COUNT=$(find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.patch' | wc -l | tr -d ' ')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::未生成任何补丁文件，请检查提交范围"
+            exit 1
+          fi
+
+          # 生成一份说明文件，随压缩包一起分发
+          {
+            echo "仓库: ${REPO_URL}"
+            echo "分支: ${BRANCH_NAME:-<默认分支>}"
+            echo "起始提交(含): $START_HASH"
+            echo "结束提交(含): $END_HASH"
+            echo "区间提交数: $COMMIT_COUNT"
+            echo "补丁类型: $PATCH_TYPE"
+            echo "补丁数量: $COUNT"
+            echo "生成时间(UTC): $(date -u +'%Y-%m-%d %H:%M:%S')"
+            echo "生成来源: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > "$OUTPUT_DIR/README.txt"
+
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "commits=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+          echo "patch_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: 打包 ZIP
+        id: create_zip
+        run: |
+          set -euo pipefail
+          TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
+          ZIP_NAME="patch_${TIMESTAMP}.zip"
+
+          cd "$WORKSPACE/patches"
+          zip -rq "$WORKSPACE/$ZIP_NAME" .
+          ls -lh "$WORKSPACE/$ZIP_NAME"
+
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "zip_path=$WORKSPACE/$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "zip_timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
+
+      - name: 清理环境
+        run: |
+          set -euo pipefail
+          rm -rf "$WORKSPACE/source_repo" "$WORKSPACE/patches"
+
+      - name: 上传 ZIP 到工作流产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.create_zip.outputs.zip_name }}
+          path: ${{ steps.create_zip.outputs.zip_path }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 创建 GitHub Release
+        id: create_release
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: patch-${{ steps.create_zip.outputs.zip_timestamp }}
+          name: Patch Files - ${{ steps.create_zip.outputs.zip_timestamp }}
+          body: |
+            自动生成的补丁文件
+
+            - 源仓库：${{ github.event.inputs.repo_url }}
+            - 提交范围：`${{ github.event.inputs.start_commit }}` → `${{ github.event.inputs.end_commit }}`（两端均含）
+            - 区间提交数：${{ steps.generate.outputs.commits }}
+            - 补丁数量：${{ steps.generate.outputs.count }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: ${{ steps.create_zip.outputs.zip_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 输出结果摘要
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "### 补丁生成结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 源仓库：${{ github.event.inputs.repo_url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 提交范围：\`${{ github.event.inputs.start_commit }}\` → \`${{ github.event.inputs.end_commit }}\`（两端均含）" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 区间提交数：${{ steps.generate.outputs.commits }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 补丁类型：${{ github.event.inputs.patch_type }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 补丁数量：${{ steps.generate.outputs.count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 产物文件：${{ steps.create_zip.outputs.zip_name }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.event.inputs.create_release }}" = "true" ]; then
+            echo "- Release：${{ steps.create_release.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "补丁生成完成"
+          echo "ZIP 文件: ${{ steps.create_zip.outputs.zip_name }}"
+          if [ "${{ github.event.inputs.create_release }}" = "true" ]; then
+            if [ "${{ steps.create_release.outcome }}" = "success" ]; then
+              echo "GitHub Release 已创建: ${{ steps.create_release.outputs.url }}"
+            else
+              echo "GitHub Release 创建失败（${{ steps.create_release.outcome }}），请检查 contents: write 权限"
+            fi
+          else
+            echo "未创建 Release，可在工作流产物（Artifacts）中下载补丁文件"
+          fi
