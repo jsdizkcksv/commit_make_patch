@@ -13,11 +13,11 @@ on:
         default: ''
         type: string
       start_commit:
-        description: '起始提交（SHA / tag / 分支名）'
+        description: '起始提交（含，SHA / tag / 分支名）'
         required: true
         type: string
       end_commit:
-        description: '结束提交（SHA / tag / 分支名）'
+        description: '结束提交（含，SHA / tag / 分支名）'
         required: true
         type: string
       patch_type:
@@ -147,20 +147,40 @@ jobs:
           echo "起始提交: $START_HASH"
           echo "结束提交: $END_HASH"
 
-          if [ "$START_HASH" = "$END_HASH" ]; then
-            echo "::error::起始提交与结束提交相同，无差异可导出"
-            exit 1
+          # 起始提交若为根提交（没有父提交），则用空树/--root 作为基线
+          if git rev-parse --verify --quiet "${START_HASH}^" >/dev/null; then
+            BASE="${START_HASH}^"
+            IS_ROOT=false
+            echo "基线: ${BASE}（起始提交的父提交）"
+          else
+            BASE=""
+            IS_ROOT=true
+            echo "基线: 空树（起始提交即仓库根提交）"
           fi
 
           OUTPUT_DIR="$WORKSPACE/patches"
           mkdir -p "$OUTPUT_DIR"
 
+          # 两端都包含：起始提交自身及其改动也会被导出
           if [ "$PATCH_TYPE" = "单个" ]; then
-            git diff "$START_HASH" "$END_HASH" > "$OUTPUT_DIR/combined.patch"
+            if [ "$IS_ROOT" = true ]; then
+              EMPTY_TREE=$(git hash-object -t tree /dev/null)
+              git diff "$EMPTY_TREE" "$END_HASH" > "$OUTPUT_DIR/combined.patch"
+            else
+              git diff "$BASE" "$END_HASH" > "$OUTPUT_DIR/combined.patch"
+            fi
             echo "patch_file=combined.patch" >> "$GITHUB_OUTPUT"
           else
-            git format-patch "$START_HASH..$END_HASH" -o "$OUTPUT_DIR" --no-signature
+            if [ "$IS_ROOT" = true ]; then
+              git format-patch --root "$END_HASH" -o "$OUTPUT_DIR" --no-signature
+            else
+              git format-patch "${BASE}..${END_HASH}" -o "$OUTPUT_DIR" --no-signature
+            fi
           fi
+
+          # 区间内提交数（含起始提交）
+          COMMIT_COUNT=$(git rev-list --count "${BASE:+${BASE}..}${END_HASH}")
+          echo "区间提交数: $COMMIT_COUNT"
 
           COUNT=$(find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.patch' | wc -l | tr -d ' ')
           if [ "$COUNT" -eq 0 ]; then
@@ -172,8 +192,9 @@ jobs:
           {
             echo "仓库: ${REPO_URL}"
             echo "分支: ${BRANCH_NAME:-<默认分支>}"
-            echo "起始提交: $START_HASH"
-            echo "结束提交: $END_HASH"
+            echo "起始提交(含): $START_HASH"
+            echo "结束提交(含): $END_HASH"
+            echo "区间提交数: $COMMIT_COUNT"
             echo "补丁类型: $PATCH_TYPE"
             echo "补丁数量: $COUNT"
             echo "生成时间(UTC): $(date -u +'%Y-%m-%d %H:%M:%S')"
@@ -181,6 +202,7 @@ jobs:
           } > "$OUTPUT_DIR/README.txt"
 
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "commits=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
           echo "patch_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
 
       - name: 打包 ZIP
@@ -222,7 +244,8 @@ jobs:
             自动生成的补丁文件
 
             - 源仓库：${{ github.event.inputs.repo_url }}
-            - 提交范围：`${{ github.event.inputs.start_commit }}` → `${{ github.event.inputs.end_commit }}`
+            - 提交范围：`${{ github.event.inputs.start_commit }}` → `${{ github.event.inputs.end_commit }}`（两端均含）
+            - 区间提交数：${{ steps.generate.outputs.commits }}
             - 补丁数量：${{ steps.generate.outputs.count }}
           draft: false
           prerelease: false
@@ -238,7 +261,8 @@ jobs:
           echo "### 补丁生成结果" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- 源仓库：${{ github.event.inputs.repo_url }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 提交范围：\`${{ github.event.inputs.start_commit }}\` → \`${{ github.event.inputs.end_commit }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 提交范围：\`${{ github.event.inputs.start_commit }}\` → \`${{ github.event.inputs.end_commit }}\`（两端均含）" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 区间提交数：${{ steps.generate.outputs.commits }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- 补丁类型：${{ github.event.inputs.patch_type }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- 补丁数量：${{ steps.generate.outputs.count }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- 产物文件：${{ steps.create_zip.outputs.zip_name }}" >> "$GITHUB_STEP_SUMMARY"
